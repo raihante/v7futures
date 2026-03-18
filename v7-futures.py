@@ -18,9 +18,10 @@ import hmac
 import json
 import logging
 import os
+import sys
 import time
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 
 import requests
@@ -113,6 +114,10 @@ MIN_PRICE_CHANGE_ABS = cfg_float("MIN_PRICE_CHANGE_ABS", 3)
 RECENTLY_CLOSED_TIMEOUT_SEC = cfg_int("RECENTLY_CLOSED_TIMEOUT_SEC", 3600)
 RECENTLY_CLOSED_FILE = cfg_get("RECENTLY_CLOSED_FILE", "recently_closed.json")
 DRY_RUN = cfg_bool("DRY_RUN", False)
+FORCE_COLOR = cfg_bool("FORCE_COLOR", False)
+NO_COLOR = cfg_bool("NO_COLOR", False)
+OUTBOUND_IP_REFRESH_SEC = cfg_int("OUTBOUND_IP_REFRESH_SEC", 1800)
+OUTBOUND_IP_SERVICE = cfg_get("OUTBOUND_IP_SERVICE", "https://api.ipify.org?format=json")
 
 
 LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
@@ -123,8 +128,42 @@ logger = logging.getLogger("v7-futures")
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
+
+class SoftColorFormatter(logging.Formatter):
+    RESET = "\033[0m"
+    LEVEL_COLORS = {
+        logging.DEBUG: "\033[38;5;111m",    # soft cyan
+        logging.INFO: "\033[38;5;114m",     # soft green
+        logging.WARNING: "\033[38;5;222m",  # soft yellow
+        logging.ERROR: "\033[38;5;210m",    # soft red
+        logging.CRITICAL: "\033[38;5;203m", # bright red
+    }
+
+    def format(self, record):
+        message = super().format(record)
+        color = self.LEVEL_COLORS.get(record.levelno, "")
+        if not color:
+            return message
+        return f"{color}{message}{self.RESET}"
+
+
+def should_use_color():
+    if NO_COLOR:
+        return False
+    if FORCE_COLOR:
+        return True
+    if not sys.stdout or not hasattr(sys.stdout, "isatty") or not sys.stdout.isatty():
+        return False
+    term = os.environ.get("TERM", "").lower()
+    if not term or term == "dumb":
+        return False
+    return True
+
 stream_handler = logging.StreamHandler()
-stream_handler.setFormatter(formatter)
+if should_use_color():
+    stream_handler.setFormatter(SoftColorFormatter("%(asctime)s | %(levelname)s | %(message)s"))
+else:
+    stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 
 file_handler = TimedRotatingFileHandler(
@@ -136,6 +175,7 @@ logger.addHandler(file_handler)
 
 session = requests.Session()
 session.headers.update({"X-MBX-APIKEY": API_KEY})
+_outbound_ip_cache = {"value": "unknown", "fetched_at": 0.0}
 
 
 def get_signature(params: str) -> str:
@@ -181,6 +221,38 @@ def json_or_none(response):
     except ValueError as exc:
         logger.error("JSON parse error: %s", exc)
         return None
+
+
+def get_outbound_ip(force=False):
+    now = time.time()
+    cached_value = _outbound_ip_cache.get("value", "unknown")
+    cached_ts = float(_outbound_ip_cache.get("fetched_at", 0.0))
+
+    if not force and cached_value != "unknown" and (now - cached_ts) < OUTBOUND_IP_REFRESH_SEC:
+        return cached_value
+
+    for attempt in range(1, 3):
+        try:
+            response = requests.get(OUTBOUND_IP_SERVICE, timeout=REQUEST_TIMEOUT_SEC)
+            response.raise_for_status()
+
+            ip_value = "unknown"
+            try:
+                payload = response.json()
+                ip_value = str(payload.get("ip", "")).strip() or "unknown"
+            except ValueError:
+                ip_value = response.text.strip() or "unknown"
+
+            if ip_value != "unknown":
+                _outbound_ip_cache["value"] = ip_value
+                _outbound_ip_cache["fetched_at"] = now
+                return ip_value
+        except requests.RequestException as exc:
+            if attempt == 2 and force:
+                logger.warning("Failed fetching outbound IP: %s", exc)
+            time.sleep(0.5 * attempt)
+
+    return cached_value
 
 
 def load_recently_closed():
@@ -674,7 +746,7 @@ def scan_opportunities(valid_symbols):
 
 def autopilot(state, symbol_meta, valid_symbols):
     clean_recently_closed(state)
-    logger.info("NekoAlpha v7 run at %s UTC", datetime.utcnow().strftime("%H:%M"))
+    logger.info("NekoAlpha v7 run at %s UTC", datetime.now(timezone.utc).strftime("%H:%M"))
 
     total, avail, margin = get_balance()
     if total <= 0:
@@ -777,6 +849,9 @@ def main():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL:
         logger.warning("Telegram not configured: signals will be logged only")
 
+    startup_ip = get_outbound_ip(force=True)
+    logger.info("Outbound fetch IP: %s", startup_ip)
+
     symbol_meta, tradable_symbols = get_exchange_info()
     if not tradable_symbols:
         logger.error("Cannot load exchangeInfo symbols. Exiting.")
@@ -789,7 +864,8 @@ def main():
     while True:
         try:
             position_count = autopilot(state, symbol_meta, valid_symbols)
-            logger.info("Cycle done. Open positions tracked: %s", position_count)
+            current_ip = get_outbound_ip(force=False)
+            logger.info("Cycle done. Open positions tracked: %s | fetch_ip=%s", position_count, current_ip)
             error_streak = 0
             time.sleep(SCAN_INTERVAL_SEC)
         except KeyboardInterrupt:
