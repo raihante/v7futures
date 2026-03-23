@@ -77,6 +77,26 @@ def cfg_bool(key, default=False):
     return value in ("1", "true", "yes", "on")
 
 
+def normalize_margin_type(value, default="CROSS"):
+    normalized = str(value).strip().upper()
+    if normalized == "CROSS":
+        return "CROSSED"
+    if normalized in ("CROSSED", "ISOLATED"):
+        return normalized
+
+    fallback = str(default).strip().upper()
+    return "ISOLATED" if fallback == "ISOLATED" else "CROSSED"
+
+
+def cfg_margin_type(key, default="CROSS"):
+    return normalize_margin_type(cfg_get(key, default), default)
+
+
+def margin_type_label(value):
+    normalized = str(value).strip().upper()
+    return "CROSS" if normalized == "CROSSED" else (normalized or "UNKNOWN")
+
+
 API_KEY = cfg_get("BINANCE_API_KEY", "")
 SECRET = cfg_get("BINANCE_SECRET", "")
 TELEGRAM_BOT_TOKEN = cfg_get("TELEGRAM_BOT_TOKEN", "")
@@ -87,38 +107,38 @@ if not API_KEY or not SECRET:
     raise SystemExit(1)
 
 
-BASE_FUTURES = "https://fapi.binance.com"
+BASE_FUTURES = cfg_get("BASE_FUTURES", "https://fapi.binance.com")
 
 
-# Runtime/risk config
-SCAN_INTERVAL_SEC = cfg_int("SCAN_INTERVAL_SEC", 60)
+#Runtime/risk config
+SCAN_INTERVAL_SEC = cfg_int("SCAN_INTERVAL_SEC", 30)
 REQUEST_TIMEOUT_SEC = cfg_int("REQUEST_TIMEOUT_SEC", 10)
 REQUEST_RETRIES = cfg_int("REQUEST_RETRIES", 3)
 REQUEST_BACKOFF_SEC = cfg_float("REQUEST_BACKOFF_SEC", 1.4)
 
 MAX_MARGIN_PERCENT = cfg_float("MAX_MARGIN_PERCENT", 30)
-ENTRY_PERCENT = cfg_float("ENTRY_PERCENT", 5)
-MAX_POSITIONS = cfg_int("MAX_POSITIONS", 8)
-MIN_ENTRY_USDT = cfg_float("MIN_ENTRY_USDT", 15)
-LEVERAGE = cfg_int("LEVERAGE", 5)
+ENTRY_PERCENT = cfg_float("ENTRY_PERCENT", 4)
+MAX_POSITIONS = cfg_int("MAX_POSITIONS", 4)
+MIN_ENTRY_USDT = cfg_float("MIN_ENTRY_USDT", 3)
+LEVERAGE = cfg_int("LEVERAGE", 15)
+MARGIN_TYPE = cfg_margin_type("MARGIN_TYPE", "CROSS")
 
-# Exit logic based on PnL percent from entry price
-TP_PERCENT = cfg_float("TP_PERCENT", 12.72)
-SL_PERCENT = cfg_float("SL_PERCENT", 5)
+#Exit logic based on PnL percent from entry price
+TP_PERCENT = cfg_float("TP_PERCENT", 3)
+SL_PERCENT = cfg_float("SL_PERCENT", 1.8)
 
-# Signal filters
-MIN_QUOTE_VOLUME = cfg_float("MIN_QUOTE_VOLUME", 10000000)
-MIN_PRICE_CHANGE_ABS = cfg_float("MIN_PRICE_CHANGE_ABS", 3)
+#Signal filters
+MIN_QUOTE_VOLUME = cfg_float("MIN_QUOTE_VOLUME", 20000000)
+MIN_PRICE_CHANGE_ABS = cfg_float("MIN_PRICE_CHANGE_ABS", 2.0)
 
-# Cooldown state
-RECENTLY_CLOSED_TIMEOUT_SEC = cfg_int("RECENTLY_CLOSED_TIMEOUT_SEC", 3600)
+#Cooldown state
+RECENTLY_CLOSED_TIMEOUT_SEC = cfg_int("RECENTLY_CLOSED_TIMEOUT_SEC", 900)
 RECENTLY_CLOSED_FILE = cfg_get("RECENTLY_CLOSED_FILE", "recently_closed.json")
 DRY_RUN = cfg_bool("DRY_RUN", False)
 FORCE_COLOR = cfg_bool("FORCE_COLOR", False)
 NO_COLOR = cfg_bool("NO_COLOR", False)
 OUTBOUND_IP_REFRESH_SEC = cfg_int("OUTBOUND_IP_REFRESH_SEC", 1800)
-OUTBOUND_IP_SERVICE = cfg_get("OUTBOUND_IP_SERVICE", "https://api.ipify.org?format=json")
-
+OUTBOUND_IP_SERVICE = cfg_get("OUTBOUND_IP_SERVICE", "https://api.ipify.org/?format=json")
 
 LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -451,6 +471,7 @@ def analyze_symbol(symbol):
 def generate_signal(analysis):
     s = analysis
     direction = s["trend"]
+    direction_emoji = "📈" if direction == "LONG" else "📉"
     trend_text = "BULLISH" if direction == "LONG" else "BEARISH"
 
     entry_breakout = s["resistance"] * (1.01 if direction == "LONG" else 0.99)
@@ -472,31 +493,51 @@ def generate_signal(analysis):
             insight = f"SHORT trend below EMA-200 with resistance {s['resistance']:.4f}."
 
     signal = (
-        f"{s['symbol']} TECHNICAL ANALYSIS\n"
-        f"Chart: https://www.tradingview.com/chart/?symbol=BINANCE:{s['symbol']}\n\n"
-        f"Indicators:\n"
+        f"🚨 {s['symbol']} TECHNICAL ANALYSIS\n"
+        f"🔗 Chart: https://www.tradingview.com/chart/?symbol=BINANCE:{s['symbol']}\n\n"
+        f"⚙️ Setup:\n"
+        f"- Bias: {direction_emoji} {trend_text}\n"
+        f"- Margin: {margin_type_label(MARGIN_TYPE)} | {LEVERAGE}x\n\n"
+        f"📊 Indicators:\n"
         f"- RSI(14): {s['rsi']:.1f}\n"
         f"- EMA21: {s['ema_21']:.6f}\n"
         f"- EMA50: {s['ema_50']:.6f}\n"
         f"- EMA200: {s['ema_200']:.6f}\n"
         f"- Trend: {trend_text}\n"
         f"- Pattern: {s['pattern']}\n\n"
-        f"Structure (Multi-TF):\n"
+        f"🧱 Structure (Multi-TF):\n"
         f"- Support: {s['support']:.6f}\n"
         f"- Resistance: {s['resistance']:.6f}\n"
         f"- Range: {(s['resistance'] - s['support']):.6f}\n\n"
-        f"Entry Strategies:\n"
+        f"🎯 Entry Strategies:\n"
         f"1) Breakout: {entry_breakout:.6f}\n"
         f"2) Bounce/Reject: {entry_bounce:.6f}\n\n"
-        f"Insight: {insight}\n\n"
-        f"Targets:\n"
+        f"🧠 Insight: {insight}\n\n"
+        f"🏁 Targets:\n"
         f"- Entry Ref: {s['price']:.6f}\n"
         f"- TP1: {s['tp1']:.6f} (Fib 1.272)\n"
         f"- TP2: {s['tp2']:.6f} (Fib 1.618)\n"
         f"- SL: {s['sl']:.6f}\n"
-        f"Timeframe: 1H"
+        f"⏰ Timeframe: 1H"
     )
     return signal
+
+
+def build_exit_message(status, symbol, direction, pnl_pct, before_balance, after_balance):
+    status_emoji = "✅" if status == "TP" else "🛑"
+    direction_emoji = "📈" if direction == "LONG" else "📉"
+    balance_delta = after_balance - before_balance
+
+    return (
+        f"{status_emoji} {status} HIT\n"
+        f"🪙 Symbol: {symbol}\n"
+        f"{direction_emoji} Direction: {direction}\n"
+        f"📊 PnL: {pnl_pct:+.2f}%\n"
+        f"⚙️ Margin: {margin_type_label(MARGIN_TYPE)} | {LEVERAGE}x\n"
+        f"💰 Balance Before: {format_usdt(before_balance)}\n"
+        f"💵 Balance After: {format_usdt(after_balance)}\n"
+        f"🔄 Delta: {format_signed_usdt(balance_delta)}"
+    )
 
 
 def send_telegram(message):
@@ -603,6 +644,20 @@ def format_qty(value):
     return text if text else "0"
 
 
+def format_usdt(value):
+    try:
+        return f"{float(value):,.2f} USDT"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def format_signed_usdt(value):
+    try:
+        return f"{float(value):+,.2f} USDT"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
 def get_price(symbol):
     url = f"{BASE_FUTURES}/fapi/v1/ticker/price?symbol={symbol}"
     r = safe_request("GET", url)
@@ -621,6 +676,70 @@ def set_leverage(symbol, leverage):
     sig = get_signature(params)
     url = f"{BASE_FUTURES}/fapi/v1/leverage?{params}&signature={sig}"
     safe_request("POST", url, signed=True)
+
+
+def get_symbol_margin_type(symbol):
+    for position in get_positions():
+        if position.get("symbol") != symbol:
+            continue
+
+        margin_type = str(position.get("marginType", "")).strip().upper()
+        if margin_type:
+            return margin_type
+
+        isolated_flag = str(position.get("isolated", "")).strip().lower()
+        if isolated_flag in ("1", "true", "yes", "on"):
+            return "ISOLATED"
+        if isolated_flag in ("0", "false", "no", "off"):
+            return "CROSSED"
+        break
+    return ""
+
+
+def set_margin_type(symbol, margin_type):
+    target = normalize_margin_type(margin_type, "CROSS")
+    current = get_symbol_margin_type(symbol)
+    if current == target:
+        return True
+
+    ts = int(time.time() * 1000)
+    params = f"symbol={symbol}&marginType={target}&timestamp={ts}"
+    sig = get_signature(params)
+    url = f"{BASE_FUTURES}/fapi/v1/marginType?{params}&signature={sig}"
+
+    for attempt in range(1, REQUEST_RETRIES + 1):
+        try:
+            response = session.post(url, timeout=REQUEST_TIMEOUT_SEC)
+            data = json_or_none(response)
+
+            if response.ok:
+                logger.info("Margin type %s => %s", symbol, margin_type_label(target))
+                return True
+
+            if isinstance(data, dict) and data.get("code") == -4046:
+                return True
+
+            if response.status_code in (429, 500, 502, 503, 504):
+                raise requests.RequestException(f"HTTP {response.status_code}")
+
+            logger.warning(
+                "Set margin type failed %s (%s/%s): %s",
+                symbol,
+                attempt,
+                REQUEST_RETRIES,
+                data or response.text,
+            )
+        except requests.RequestException as exc:
+            logger.warning(
+                "Margin type request error %s (%s/%s): %s",
+                symbol,
+                attempt,
+                REQUEST_RETRIES,
+                exc,
+            )
+        time.sleep(REQUEST_BACKOFF_SEC ** attempt)
+
+    return False
 
 
 def compute_order_qty(symbol, amount_usdt, symbol_meta):
@@ -662,6 +781,10 @@ def open_position(symbol, side, amount_usdt, symbol_meta):
         logger.info("[DRY_RUN] Open %s %s qty=%s", side, symbol, qty_str)
         return {"dry_run": True, "symbol": symbol, "side": side, "quantity": qty_str}
 
+    if not set_margin_type(symbol, MARGIN_TYPE):
+        logger.warning("Skip order %s: failed to set margin mode %s", symbol, margin_type_label(MARGIN_TYPE))
+        return None
+
     set_leverage(symbol, LEVERAGE)
 
     ts = int(time.time() * 1000)
@@ -674,7 +797,15 @@ def open_position(symbol, side, amount_usdt, symbol_meta):
         logger.warning("Open order failed %s: %s", symbol, data)
         return None
 
-    logger.info("Opened %s %s qty=%s price=%s", side, symbol, qty, price)
+    logger.info(
+        "Opened %s %s qty=%s price=%s mode=%s leverage=%sx",
+        side,
+        symbol,
+        qty,
+        price,
+        margin_type_label(MARGIN_TYPE),
+        LEVERAGE,
+    )
     return data
 
 
@@ -786,10 +917,38 @@ def autopilot(state, symbol_meta, valid_symbols):
             logger.info("Position %s | %s | PnL=%+.2f%% %s", symbol, direction, pnl_pct, status)
 
             if status:
-                close_position(symbol, abs(amt), direction, symbol_meta)
-                state[symbol] = time.time()
-                save_recently_closed(state)
-                send_telegram(f"{status} HIT: {symbol} {direction} {pnl_pct:+.2f}%")
+                before_total, _, _ = get_balance()
+                if before_total <= 0:
+                    before_total = total
+
+                close_result = close_position(symbol, abs(amt), direction, symbol_meta)
+                if close_result:
+                    after_total, after_avail, after_margin = get_balance()
+                    if after_total <= 0:
+                        after_total = before_total
+                        after_avail = avail
+                        after_margin = margin
+
+                    total = after_total
+                    avail = after_avail
+                    margin = after_margin
+                    margin_used = max(margin - avail, 0)
+                    margin_percent = (margin_used / total) * 100 if total > 0 else 0
+
+                    state[symbol] = time.time()
+                    save_recently_closed(state)
+                    send_telegram(
+                        build_exit_message(
+                            status,
+                            symbol,
+                            direction,
+                            pnl_pct,
+                            before_total,
+                            after_total,
+                        )
+                    )
+                else:
+                    logger.warning("Failed closing %s after %s trigger", symbol, status)
 
             open_pos.append({"symbol": symbol, "dir": direction, "pct": pnl_pct})
         except (TypeError, ValueError, ZeroDivisionError) as exc:
