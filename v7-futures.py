@@ -116,7 +116,7 @@ BASE_FUTURES = cfg_get("BASE_FUTURES", "https://fapi.binance.com")
 # 2) config.cfg
 # 3) in-code defaults below
 #Runtime/risk config
-SCAN_INTERVAL_SEC = cfg_int("SCAN_INTERVAL_SEC", 30)
+SCAN_INTERVAL_SEC = cfg_int("SCAN_INTERVAL_SEC", 5)
 REQUEST_TIMEOUT_SEC = cfg_int("REQUEST_TIMEOUT_SEC", 10)
 REQUEST_RETRIES = cfg_int("REQUEST_RETRIES", 3)
 REQUEST_BACKOFF_SEC = cfg_float("REQUEST_BACKOFF_SEC", 1.4)
@@ -133,8 +133,8 @@ TP_PERCENT = cfg_float("TP_PERCENT", 3)
 SL_PERCENT = cfg_float("SL_PERCENT", 1.8)
 
 #Signal filters
-MIN_QUOTE_VOLUME = cfg_float("MIN_QUOTE_VOLUME", 20000000)
-MIN_PRICE_CHANGE_ABS = cfg_float("MIN_PRICE_CHANGE_ABS", 2.0)
+MIN_QUOTE_VOLUME = cfg_float("MIN_QUOTE_VOLUME", 100000000)
+MIN_PRICE_CHANGE_ABS = cfg_float("MIN_PRICE_CHANGE_ABS", 0.8)
 MIN_LONG_PRICE_CHANGE_ABS = cfg_float("MIN_LONG_PRICE_CHANGE_ABS", 10.0)
 MIN_SHORT_PRICE_CHANGE_ABS = cfg_float("MIN_SHORT_PRICE_CHANGE_ABS", 8.0)
 LONG_OVERBOUGHT_RSI = cfg_float("LONG_OVERBOUGHT_RSI", 72)
@@ -242,7 +242,23 @@ def safe_request(method: str, url: str, signed: bool = False, **kwargs):
         except requests.RequestException as exc:
             attempt += 1
             wait = REQUEST_BACKOFF_SEC ** attempt
-            logger.warning("Request error (%s/%s): %s | %s", attempt, REQUEST_RETRIES, url, exc)
+            response_text = ""
+            if hasattr(exc, "response") and exc.response is not None:
+                try:
+                    response_text = exc.response.text.strip()
+                except Exception:
+                    response_text = ""
+            if response_text:
+                logger.warning(
+                    "Request error (%s/%s): %s | %s | response=%s",
+                    attempt,
+                    REQUEST_RETRIES,
+                    url,
+                    exc,
+                    response_text[:500],
+                )
+            else:
+                logger.warning("Request error (%s/%s): %s | %s", attempt, REQUEST_RETRIES, url, exc)
             time.sleep(wait)
 
     msg = "signed" if signed else "public"
@@ -809,6 +825,40 @@ def build_protective_prices(entry_price, direction):
     return tp_price, sl_price
 
 
+def get_protective_reference_price(symbol, snapshot=None):
+    if PROTECTIVE_WORKING_TYPE == "MARK_PRICE":
+        if snapshot:
+            try:
+                mark_price = float(snapshot.get("mark_price", 0) or 0)
+            except (TypeError, ValueError):
+                mark_price = 0.0
+            if mark_price > 0:
+                return mark_price
+        refreshed = get_position_snapshot(symbol)
+        if refreshed:
+            try:
+                mark_price = float(refreshed.get("mark_price", 0) or 0)
+            except (TypeError, ValueError):
+                mark_price = 0.0
+            if mark_price > 0:
+                return mark_price
+    return get_price(symbol) or 0.0
+
+
+def would_trigger_immediately(direction, order_type, reference_price, stop_price):
+    if reference_price <= 0 or stop_price <= 0:
+        return False
+
+    if direction == "LONG":
+        if order_type == "TAKE_PROFIT_MARKET":
+            return reference_price >= stop_price
+        return reference_price <= stop_price
+
+    if order_type == "TAKE_PROFIT_MARKET":
+        return reference_price <= stop_price
+    return reference_price >= stop_price
+
+
 def place_protective_close_order(symbol, direction, order_type, stop_price, symbol_meta):
     side = "SELL" if direction == "LONG" else "BUY"
     meta = symbol_meta.get(symbol, {})
@@ -866,6 +916,44 @@ def sync_protective_orders(symbol, direction, symbol_meta, order_data=None):
         return None
 
     tp_price, sl_price = build_protective_prices(entry_price, direction)
+    reference_price = get_protective_reference_price(symbol, snapshot)
+
+    if would_trigger_immediately(direction, "TAKE_PROFIT_MARKET", reference_price, tp_price):
+        logger.warning(
+            "Protective TP would immediately trigger %s | ref=%s | tp=%s | workingType=%s",
+            symbol,
+            format_price(reference_price),
+            format_price(tp_price),
+            PROTECTIVE_WORKING_TYPE,
+        )
+        return {
+            "action": "close_now",
+            "status": "TP",
+            "symbol": symbol,
+            "direction": direction,
+            "entry_price": entry_price,
+            "trigger_price": tp_price,
+            "last_mark": reference_price,
+        }
+
+    if would_trigger_immediately(direction, "STOP_MARKET", reference_price, sl_price):
+        logger.warning(
+            "Protective SL would immediately trigger %s | ref=%s | sl=%s | workingType=%s",
+            symbol,
+            format_price(reference_price),
+            format_price(sl_price),
+            PROTECTIVE_WORKING_TYPE,
+        )
+        return {
+            "action": "close_now",
+            "status": "SL",
+            "symbol": symbol,
+            "direction": direction,
+            "entry_price": entry_price,
+            "trigger_price": sl_price,
+            "last_mark": reference_price,
+        }
+
     tp_result = place_protective_close_order(symbol, direction, "TAKE_PROFIT_MARKET", tp_price, symbol_meta)
     sl_result = place_protective_close_order(symbol, direction, "STOP_MARKET", sl_price, symbol_meta)
     if tp_result is None or sl_result is None:
@@ -1287,6 +1375,26 @@ def autopilot(state, tracked_positions, symbol_meta, valid_symbols):
         if result:
             if ENABLE_PROTECTIVE_ORDERS and not DRY_RUN:
                 protection = sync_protective_orders(symbol, opp["trend"], symbol_meta, result)
+                if protection and protection.get("action") == "close_now":
+                    logger.warning(
+                        "Protective order skipped for %s because trigger was already reached; closing at market",
+                        symbol,
+                    )
+                    snapshot = get_position_snapshot(symbol)
+                    if snapshot:
+                        close_position(symbol, snapshot["qty"], snapshot["direction"], symbol_meta)
+                    state[symbol] = time.time()
+                    save_recently_closed(state)
+                    send_telegram(
+                        build_managed_exit_message(
+                            protection.get("status", "EXIT"),
+                            symbol,
+                            opp["trend"],
+                            float(protection.get("entry_price", 0) or 0),
+                            float(protection.get("trigger_price", 0) or 0),
+                        )
+                    )
+                    continue
                 if not protection:
                     logger.error("Protective orders failed for %s, closing position immediately", symbol)
                     snapshot = get_position_snapshot(symbol)

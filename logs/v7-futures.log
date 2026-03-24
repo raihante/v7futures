@@ -34,3 +34,29 @@
 2026-03-24 21:45:11,518 | INFO | Using 82 symbols from local file after exchange filter
 2026-03-24 21:45:11,534 | INFO | Loaded 82 symbols from futures_symbols.json
 2026-03-24 21:45:11,535 | INFO | Using 82 symbols from local file after exchange filter
+2026-03-24 23:03:36,731 | INFO | Starting NekoAlpha v7 (24/7 mode)
+2026-03-24 23:03:36,734 | INFO | Config path: D:\SOURCE CODE\FUTURE BOT\v7futures\config.cfg
+2026-03-24 23:03:37,544 | WARNING | Failed fetching outbound IP: 429 Client Error: Too Many Requests for url: https://api.ipify.org/?format=json
+2026-03-24 23:03:38,547 | INFO | Outbound fetch IP: unknown
+2026-03-24 23:03:38,940 | INFO | Loaded 82 symbols from futures_symbols.json
+2026-03-24 23:03:38,942 | INFO | Using 82 symbols from local file after exchange filter
+2026-03-24 23:03:38,943 | INFO | NekoAlpha v7 run at 16:03 UTC
+2026-03-24 23:03:39,055 | WARNING | Request error (1/3): https://fapi.binance.com/fapi/v3/account?timestamp=1774368218944&signature=c750f53010b7a83eca59aa7733391211021daecc606c8404b88cd19359bc60a9 | 401 Client Error: Unauthorized for url: https://fapi.binance.com/fapi/v3/account?timestamp=1774368218944&signature=c750f53010b7a83eca59aa7733391211021daecc606c8404b88cd19359bc60a9
+2026-03-24 23:03:40,568 | WARNING | Request error (2/3): https://fapi.binance.com/fapi/v3/account?timestamp=1774368218944&signature=c750f53010b7a83eca59aa7733391211021daecc606c8404b88cd19359bc60a9 | 401 Client Error: Unauthorized for url: https://fapi.binance.com/fapi/v3/account?timestamp=1774368218944&signature=c750f53010b7a83eca59aa7733391211021daecc606c8404b88cd19359bc60a9
+2026-03-24 23:03:42,637 | WARNING | Request error (3/3): https://fapi.binance.com/fapi/v3/account?timestamp=1774368218944&signature=c750f53010b7a83eca59aa7733391211021daecc606c8404b88cd19359bc60a9 | 401 Client Error: Unauthorized for url: https://fapi.binance.com/fapi/v3/account?timestamp=1774368218944&signature=c750f53010b7a83eca59aa7733391211021daecc606c8404b88cd19359bc60a9
+2026-03-24 23:03:45,382 | ERROR | Request failed after retries (signed): https://fapi.binance.com/fapi/v3/account?timestamp=1774368218944&signature=c750f53010b7a83eca59aa7733391211021daecc606c8404b88cd19359bc60a9
+2026-03-24 23:03:45,383 | ERROR | Balance fetch failed: None
+2026-03-24 23:03:45,383 | ERROR | Failed to get balance
+2026-03-24 23:03:47,123 | INFO | Cycle done. Open positions tracked: 0 | fetch_ip=unknown
+2026-03-24 23:04:17,124 | INFO | NekoAlpha v7 run at 16:04 UTC
+2026-03-24 23:04:17,239 | WARNING | Request error (1/3): https://fapi.binance.com/fapi/v3/account?timestamp=1774368257125&signature=09b5d53e2dca2aa3137fad5d0821b5311138b44f0e4a8c78cd86839e04c9140b | 401 Client Error: Unauthorized for url: https://fapi.binance.com/fapi/v3/account?timestamp=1774368257125&signature=09b5d53e2dca2aa3137fad5d0821b5311138b44f0e4a8c78cd86839e04c9140b
+2026-03-24 23:04:18,745 | WARNING | Request error (2/3): https://fapi.binance.com/fapi/v3/account?timestamp=1774368257125&signature=09b5d53e2dca2aa3137fad5d0821b5311138b44f0e4a8c78cd86839e04c9140b | 401 Client Error: Unauthorized for url: https://fapi.binance.com/fapi/v3/account?timestamp=1774368257125&signature=09b5d53e2dca2aa3137fad5d0821b5311138b44f0e4a8c78cd86839e04c9140b
+2026-03-24 23:04:20,815 | WARNING | Request error (3/3): https://fapi.binance.com/fapi/v3/account?timestamp=1774368257125&signature=09b5d53e2dca2aa3137fad5d0821b5311138b44f0e4a8c78cd86839e04c9140b | 401 Client Error: Unauthorized for url: https://fapi.binance.com/fapi/v3/account?timestamp=1774368257125&signature=09b5d53e2dca2aa3137fad5d0821b5311138b44f0e4a8c78cd86839e04c9140b
+2026-03-24 23:04:23,560 | ERROR | Request failed after retries (signed): https://fapi.binance.com/fapi/v3/account?timestamp=1774368257125&signature=09b5d53e2dca2aa3137fad5d0821b5311138b44f0e4a8c78cd86839e04c9140b
+2026-03-24 23:04:23,561 | ERROR | Balance fetch failed: None
+2026-03-24 23:04:23,561 | ERROR | Failed to get balance
+2026-03-24 23:04:25,373 | INFO | Cycle done. Open positions tracked: 0 | fetch_ip=unknown
+2026-03-24 23:08:10,177 | WARNING | Request error (1/3): https://fapi.binance.com/fapi/v2/positionRisk?timestamp=1774368489833&signature=ecb846cf49de8f1b0908e9dc62636f68158ec53826b848c8aa337701c32e7ffc | 401 Client Error: Unauthorized for url: https://fapi.binance.com/fapi/v2/positionRisk?timestamp=1774368489833&signature=ecb846cf49de8f1b0908e9dc62636f68158ec53826b848c8aa337701c32e7ffc
+2026-03-24 23:08:11,688 | WARNING | Request error (2/3): https://fapi.binance.com/fapi/v2/positionRisk?timestamp=1774368489833&signature=ecb846cf49de8f1b0908e9dc62636f68158ec53826b848c8aa337701c32e7ffc | 401 Client Error: Unauthorized for url: https://fapi.binance.com/fapi/v2/positionRisk?timestamp=1774368489833&signature=ecb846cf49de8f1b0908e9dc62636f68158ec53826b848c8aa337701c32e7ffc
+2026-03-24 23:08:13,764 | WARNING | Request error (3/3): https://fapi.binance.com/fapi/v2/positionRisk?timestamp=1774368489833&signature=ecb846cf49de8f1b0908e9dc62636f68158ec53826b848c8aa337701c32e7ffc | 401 Client Error: Unauthorized for url: https://fapi.binance.com/fapi/v2/positionRisk?timestamp=1774368489833&signature=ecb846cf49de8f1b0908e9dc62636f68158ec53826b848c8aa337701c32e7ffc
+2026-03-24 23:08:16,509 | ERROR | Request failed after retries (signed): https://fapi.binance.com/fapi/v2/positionRisk?timestamp=1774368489833&signature=ecb846cf49de8f1b0908e9dc62636f68158ec53826b848c8aa337701c32e7ffc
