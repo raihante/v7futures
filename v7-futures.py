@@ -23,6 +23,7 @@ import time
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
+from urllib.parse import urlencode
 
 import requests
 
@@ -110,6 +111,10 @@ if not API_KEY or not SECRET:
 BASE_FUTURES = cfg_get("BASE_FUTURES", "https://fapi.binance.com")
 
 
+# Config precedence:
+# 1) environment variables
+# 2) config.cfg
+# 3) in-code defaults below
 #Runtime/risk config
 SCAN_INTERVAL_SEC = cfg_int("SCAN_INTERVAL_SEC", 30)
 REQUEST_TIMEOUT_SEC = cfg_int("REQUEST_TIMEOUT_SEC", 10)
@@ -130,6 +135,13 @@ SL_PERCENT = cfg_float("SL_PERCENT", 1.8)
 #Signal filters
 MIN_QUOTE_VOLUME = cfg_float("MIN_QUOTE_VOLUME", 20000000)
 MIN_PRICE_CHANGE_ABS = cfg_float("MIN_PRICE_CHANGE_ABS", 2.0)
+MIN_LONG_PRICE_CHANGE_ABS = cfg_float("MIN_LONG_PRICE_CHANGE_ABS", 10.0)
+MIN_SHORT_PRICE_CHANGE_ABS = cfg_float("MIN_SHORT_PRICE_CHANGE_ABS", 8.0)
+LONG_OVERBOUGHT_RSI = cfg_float("LONG_OVERBOUGHT_RSI", 72)
+LONG_BREAKOUT_NEAR_RATIO = cfg_float("LONG_BREAKOUT_NEAR_RATIO", 0.995)
+SHORT_OVERSOLD_RSI = cfg_float("SHORT_OVERSOLD_RSI", 30)
+SHORT_BREAKDOWN_NEAR_RATIO = cfg_float("SHORT_BREAKDOWN_NEAR_RATIO", 1.002)
+MAX_NEW_SIGNALS_PER_CYCLE = cfg_int("MAX_NEW_SIGNALS_PER_CYCLE", 2)
 
 #Cooldown state
 RECENTLY_CLOSED_TIMEOUT_SEC = cfg_int("RECENTLY_CLOSED_TIMEOUT_SEC", 900)
@@ -139,6 +151,11 @@ FORCE_COLOR = cfg_bool("FORCE_COLOR", False)
 NO_COLOR = cfg_bool("NO_COLOR", False)
 OUTBOUND_IP_REFRESH_SEC = cfg_int("OUTBOUND_IP_REFRESH_SEC", 1800)
 OUTBOUND_IP_SERVICE = cfg_get("OUTBOUND_IP_SERVICE", "https://api.ipify.org/?format=json")
+ENABLE_PROTECTIVE_ORDERS = cfg_bool("ENABLE_PROTECTIVE_ORDERS", True)
+PROTECTIVE_WORKING_TYPE = str(cfg_get("PROTECTIVE_WORKING_TYPE", "MARK_PRICE")).strip().upper() or "MARK_PRICE"
+PROTECTIVE_PRICE_PROTECT = cfg_bool("PROTECTIVE_PRICE_PROTECT", True)
+PROTECTIVE_SYNC_RETRIES = cfg_int("PROTECTIVE_SYNC_RETRIES", 5)
+PROTECTIVE_SYNC_DELAY_SEC = cfg_float("PROTECTIVE_SYNC_DELAY_SEC", 0.6)
 
 LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -345,6 +362,40 @@ def get_positions():
     return data
 
 
+def signed_request_json(method, path, params):
+    if "timestamp" not in params:
+        params = {**params, "timestamp": int(time.time() * 1000)}
+    query = urlencode(params)
+    sig = get_signature(query)
+    url = f"{BASE_FUTURES}{path}?{query}&signature={sig}"
+    response = safe_request(method, url, signed=True)
+    return json_or_none(response)
+
+
+def get_position_snapshot(symbol):
+    for position in get_positions():
+        try:
+            if position.get("symbol") != symbol:
+                continue
+
+            amt = float(position.get("positionAmt", 0))
+            if amt == 0:
+                continue
+
+            entry_price = float(position.get("entryPrice", 0))
+            mark_price = float(position.get("markPrice", 0))
+            return {
+                "symbol": symbol,
+                "qty": abs(amt),
+                "entry_price": entry_price,
+                "mark_price": mark_price,
+                "direction": "SHORT" if amt < 0 else "LONG",
+            }
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def get_klines(symbol, interval="1h", limit=250):
     url = f"{BASE_FUTURES}/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
     r = safe_request("GET", url)
@@ -523,6 +574,30 @@ def generate_signal(analysis):
     return signal
 
 
+def passes_entry_filter(analysis):
+    price = analysis["price"]
+    rsi = analysis["rsi"]
+
+    if analysis["trend"] == "LONG":
+        resistance = analysis["resistance"]
+        # Avoid chasing a stretched long before price is actually pressing resistance.
+        if rsi > LONG_OVERBOUGHT_RSI and price < (resistance * LONG_BREAKOUT_NEAR_RATIO):
+            return False
+    else:
+        support = analysis["support"]
+        # Avoid fresh breakdown shorts when the move is already exhausted at support.
+        if rsi < SHORT_OVERSOLD_RSI and price <= (support * SHORT_BREAKDOWN_NEAR_RATIO):
+            return False
+
+    return True
+
+
+def passes_momentum_filter(analysis, price_change_pct):
+    if analysis["trend"] == "LONG":
+        return price_change_pct >= MIN_LONG_PRICE_CHANGE_ABS
+    return abs(price_change_pct) >= MIN_SHORT_PRICE_CHANGE_ABS
+
+
 def build_exit_message(status, symbol, direction, pnl_pct, before_balance, after_balance):
     status_emoji = "✅" if status == "TP" else "🛑"
     direction_emoji = "📈" if direction == "LONG" else "📉"
@@ -537,6 +612,28 @@ def build_exit_message(status, symbol, direction, pnl_pct, before_balance, after
         f"💰 Balance Before: {format_usdt(before_balance)}\n"
         f"💵 Balance After: {format_usdt(after_balance)}\n"
         f"🔄 Delta: {format_signed_usdt(balance_delta)}"
+    )
+
+
+def build_managed_exit_message(status, symbol, direction, entry_price, trigger_price):
+    if entry_price > 0 and trigger_price > 0:
+        if direction == "LONG":
+            pnl_pct = ((trigger_price - entry_price) / entry_price) * 100
+        else:
+            pnl_pct = ((entry_price - trigger_price) / entry_price) * 100
+    else:
+        pnl_pct = 0.0
+
+    status_emoji = "TP" if status == "TP" else "SL" if status == "SL" else "EXIT"
+    return (
+        f"{status_emoji} MANAGED EXIT\n"
+        f"Symbol: {symbol}\n"
+        f"Direction: {direction}\n"
+        f"Trigger: {status}\n"
+        f"Est. PnL: {pnl_pct:+.2f}%\n"
+        f"Entry: {format_price(entry_price)}\n"
+        f"Exit Trigger: {format_price(trigger_price)}\n"
+        f"Margin: {margin_type_label(MARGIN_TYPE)} | {LEVERAGE}x"
     )
 
 
@@ -606,9 +703,12 @@ def get_exchange_info():
             step_size = 1.0
             min_qty = 0.0
             min_notional = 0.0
+            tick_size = 0.0
             for f in s.get("filters", []):
                 filter_type = f.get("filterType")
-                if filter_type in ("LOT_SIZE", "MARKET_LOT_SIZE"):
+                if filter_type == "PRICE_FILTER":
+                    tick_size = float(f.get("tickSize", 0))
+                elif filter_type in ("LOT_SIZE", "MARKET_LOT_SIZE"):
                     step_size = float(f.get("stepSize", 1))
                     min_qty = float(f.get("minQty", 0))
                 elif filter_type in ("MIN_NOTIONAL", "NOTIONAL"):
@@ -618,6 +718,7 @@ def get_exchange_info():
                 "step_size": step_size,
                 "min_qty": min_qty,
                 "min_notional": min_notional,
+                "tick_size": tick_size,
             }
             tradable_symbols.add(symbol)
         except (KeyError, TypeError, ValueError):
@@ -639,7 +740,18 @@ def round_step(qty, step, mode="floor"):
     return float(rounded)
 
 
+def round_price(value, tick_size, mode="floor"):
+    if tick_size <= 0:
+        return float(value)
+    return round_step(value, tick_size, mode=mode)
+
+
 def format_qty(value):
+    text = f"{float(value):.12f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def format_price(value):
     text = f"{float(value):.12f}".rstrip("0").rstrip(".")
     return text if text else "0"
 
@@ -668,6 +780,114 @@ def get_price(symbol):
         return float(data["price"])
     except (TypeError, ValueError):
         return None
+
+
+def cancel_all_open_orders(symbol):
+    if DRY_RUN:
+        logger.info("[DRY_RUN] Cancel all open orders for %s", symbol)
+        return True
+
+    data = signed_request_json("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
+    if not data:
+        logger.warning("Cancel open orders failed %s: empty response", symbol)
+        return False
+
+    code = data.get("code") if isinstance(data, dict) else None
+    if isinstance(code, int) and code < 0:
+        logger.warning("Cancel open orders failed %s: %s", symbol, data)
+        return False
+    return True
+
+
+def build_protective_prices(entry_price, direction):
+    if direction == "LONG":
+        tp_price = entry_price * (1 + (TP_PERCENT / 100))
+        sl_price = entry_price * (1 - (SL_PERCENT / 100))
+    else:
+        tp_price = entry_price * (1 - (TP_PERCENT / 100))
+        sl_price = entry_price * (1 + (SL_PERCENT / 100))
+    return tp_price, sl_price
+
+
+def place_protective_close_order(symbol, direction, order_type, stop_price, symbol_meta):
+    side = "SELL" if direction == "LONG" else "BUY"
+    meta = symbol_meta.get(symbol, {})
+    tick_size = float(meta.get("tick_size", 0))
+
+    trigger_above = (
+        (direction == "LONG" and order_type == "TAKE_PROFIT_MARKET")
+        or (direction == "SHORT" and order_type == "STOP_MARKET")
+    )
+    rounded_stop = round_price(stop_price, tick_size, mode="ceil" if trigger_above else "floor")
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": order_type,
+        "stopPrice": format_price(rounded_stop),
+        "closePosition": "true",
+        "workingType": PROTECTIVE_WORKING_TYPE,
+        "priceProtect": "TRUE" if PROTECTIVE_PRICE_PROTECT else "FALSE",
+    }
+    data = signed_request_json("POST", "/fapi/v1/order", params)
+    if not data or (isinstance(data, dict) and isinstance(data.get("code"), int) and data.get("code") < 0):
+        logger.warning("Protective order failed %s %s: %s", symbol, order_type, data)
+        return None
+    return rounded_stop
+
+
+def sync_protective_orders(symbol, direction, symbol_meta, order_data=None):
+    if DRY_RUN or not ENABLE_PROTECTIVE_ORDERS:
+        return {}
+
+    if not cancel_all_open_orders(symbol):
+        return None
+
+    entry_price = 0.0
+    if isinstance(order_data, dict):
+        for key in ("avgPrice", "price"):
+            try:
+                value = float(order_data.get(key, 0))
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                entry_price = value
+                break
+
+    snapshot = None
+    for attempt in range(1, PROTECTIVE_SYNC_RETRIES + 1):
+        snapshot = get_position_snapshot(symbol)
+        if snapshot and snapshot.get("entry_price", 0) > 0:
+            entry_price = snapshot["entry_price"]
+            break
+        time.sleep(PROTECTIVE_SYNC_DELAY_SEC * attempt)
+
+    if entry_price <= 0:
+        logger.warning("Protective sync failed %s: missing entry price", symbol)
+        return None
+
+    tp_price, sl_price = build_protective_prices(entry_price, direction)
+    tp_result = place_protective_close_order(symbol, direction, "TAKE_PROFIT_MARKET", tp_price, symbol_meta)
+    sl_result = place_protective_close_order(symbol, direction, "STOP_MARKET", sl_price, symbol_meta)
+    if tp_result is None or sl_result is None:
+        cancel_all_open_orders(symbol)
+        return None
+
+    logger.info(
+        "Protective orders armed %s | %s | TP=%s | SL=%s | workingType=%s",
+        symbol,
+        direction,
+        format_price(tp_result),
+        format_price(sl_result),
+        PROTECTIVE_WORKING_TYPE,
+    )
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "entry_price": entry_price,
+        "tp_price": tp_result,
+        "sl_price": sl_result,
+        "last_mark": snapshot.get("mark_price", entry_price) if snapshot else entry_price,
+    }
 
 
 def set_leverage(symbol, leverage):
@@ -787,25 +1007,39 @@ def open_position(symbol, side, amount_usdt, symbol_meta):
 
     set_leverage(symbol, LEVERAGE)
 
-    ts = int(time.time() * 1000)
-    params = f"symbol={symbol}&side={side}&type=MARKET&quantity={qty_str}&timestamp={ts}"
-    sig = get_signature(params)
-    url = f"{BASE_FUTURES}/fapi/v1/order?{params}&signature={sig}"
-    r = safe_request("POST", url, signed=True)
-    data = json_or_none(r)
+    data = signed_request_json(
+        "POST",
+        "/fapi/v1/order",
+        {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": qty_str,
+            "newOrderRespType": "RESULT",
+        },
+    )
     if not data or "code" in data:
         logger.warning("Open order failed %s: %s", symbol, data)
         return None
+
+    try:
+        avg_price = float(data.get("avgPrice", 0) or 0)
+    except (TypeError, ValueError):
+        avg_price = 0.0
+    if avg_price <= 0:
+        avg_price = price
 
     logger.info(
         "Opened %s %s qty=%s price=%s mode=%s leverage=%sx",
         side,
         symbol,
         qty,
-        price,
+        avg_price,
         margin_type_label(MARGIN_TYPE),
         LEVERAGE,
     )
+    data["_entry_price"] = avg_price
+    data["_entry_qty"] = qty
     return data
 
 
@@ -826,15 +1060,19 @@ def close_position(symbol, qty, direction, symbol_meta):
         logger.info("[DRY_RUN] Close %s %s qty=%s", side, symbol, qty_str)
         return {"dry_run": True, "symbol": symbol, "side": side, "quantity": qty_str}
 
-    ts = int(time.time() * 1000)
-    params = (
-        f"symbol={symbol}&side={side}&type=MARKET&reduceOnly=true"
-        f"&quantity={qty_str}&timestamp={ts}"
+    cancel_all_open_orders(symbol)
+    data = signed_request_json(
+        "POST",
+        "/fapi/v1/order",
+        {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "reduceOnly": "true",
+            "quantity": qty_str,
+            "newOrderRespType": "RESULT",
+        },
     )
-    sig = get_signature(params)
-    url = f"{BASE_FUTURES}/fapi/v1/order?{params}&signature={sig}"
-    r = safe_request("POST", url, signed=True)
-    data = json_or_none(r)
     if not data or "code" in data:
         logger.warning("Close order failed %s: %s", symbol, data)
         return None
@@ -867,6 +1105,14 @@ def scan_opportunities(valid_symbols):
         analysis = analyze_symbol(symbol)
         if not analysis:
             continue
+        if not passes_entry_filter(analysis):
+            continue
+
+        if not passes_momentum_filter(analysis, pct):
+            continue
+
+        analysis["price_change_pct"] = pct
+        analysis["quote_volume"] = vol
 
         if (analysis["trend"] == "LONG" and pct > 0) or (analysis["trend"] == "SHORT" and pct < 0):
             opportunities.append(analysis)
@@ -875,7 +1121,7 @@ def scan_opportunities(valid_symbols):
     return opportunities
 
 
-def autopilot(state, symbol_meta, valid_symbols):
+def autopilot(state, tracked_positions, symbol_meta, valid_symbols):
     clean_recently_closed(state)
     logger.info("NekoAlpha v7 run at %s UTC", datetime.now(timezone.utc).strftime("%H:%M"))
 
@@ -889,6 +1135,7 @@ def autopilot(state, symbol_meta, valid_symbols):
     logger.info("Balance=%.2f | MarginUsed=%.2f%%", total, margin_percent)
 
     positions = get_positions()
+    current_positions = {}
     open_pos = []
 
     for p in positions:
@@ -901,6 +1148,14 @@ def autopilot(state, symbol_meta, valid_symbols):
             entry = float(p.get("entryPrice", 0))
             mark = float(p.get("markPrice", 0))
             direction = "SHORT" if amt < 0 else "LONG"
+            current_positions[symbol] = {
+                "direction": direction,
+                "entry_price": entry,
+                "last_mark": mark,
+                "qty": abs(amt),
+            }
+            if symbol in tracked_positions:
+                tracked_positions[symbol]["last_mark"] = mark
 
             # Fixed bug: SHORT pnl direction differs from LONG
             if direction == "LONG":
@@ -937,6 +1192,7 @@ def autopilot(state, symbol_meta, valid_symbols):
 
                     state[symbol] = time.time()
                     save_recently_closed(state)
+                    tracked_positions.pop(symbol, None)
                     send_telegram(
                         build_exit_message(
                             status,
@@ -947,12 +1203,54 @@ def autopilot(state, symbol_meta, valid_symbols):
                             after_total,
                         )
                     )
+                    continue
                 else:
                     logger.warning("Failed closing %s after %s trigger", symbol, status)
 
             open_pos.append({"symbol": symbol, "dir": direction, "pct": pnl_pct})
         except (TypeError, ValueError, ZeroDivisionError) as exc:
             logger.warning("Position parse error: %s", exc)
+
+    disappeared_symbols = [symbol for symbol in list(tracked_positions) if symbol not in current_positions]
+    for symbol in disappeared_symbols:
+        tracked = tracked_positions.pop(symbol, {})
+        trigger_price = tracked.get("last_mark", tracked.get("entry_price", 0))
+        status = "EXIT"
+        tp_price = float(tracked.get("tp_price", 0) or 0)
+        sl_price = float(tracked.get("sl_price", 0) or 0)
+        direction = tracked.get("direction", "LONG")
+
+        latest_price = get_price(symbol)
+        if latest_price and latest_price > 0:
+            trigger_price = latest_price
+
+        if direction == "LONG":
+            if tp_price > 0 and trigger_price >= (tp_price * 0.998):
+                status = "TP"
+                trigger_price = tp_price
+            elif sl_price > 0 and trigger_price <= (sl_price * 1.002):
+                status = "SL"
+                trigger_price = sl_price
+        else:
+            if tp_price > 0 and trigger_price <= (tp_price * 1.002):
+                status = "TP"
+                trigger_price = tp_price
+            elif sl_price > 0 and trigger_price >= (sl_price * 0.998):
+                status = "SL"
+                trigger_price = sl_price
+
+        cancel_all_open_orders(symbol)
+        state[symbol] = time.time()
+        save_recently_closed(state)
+        send_telegram(
+            build_managed_exit_message(
+                status,
+                symbol,
+                direction,
+                float(tracked.get("entry_price", 0) or 0),
+                float(trigger_price or 0),
+            )
+        )
 
     if margin_percent >= MAX_MARGIN_PERCENT or len(open_pos) >= MAX_POSITIONS:
         return len(open_pos)
@@ -962,7 +1260,8 @@ def autopilot(state, symbol_meta, valid_symbols):
         logger.info("No opportunities this cycle")
         return len(open_pos)
 
-    for opp in opportunities[:5]:
+    eligible_signals = 0
+    for opp in opportunities:
         if len(open_pos) >= MAX_POSITIONS or margin_percent >= MAX_MARGIN_PERCENT:
             break
 
@@ -971,6 +1270,10 @@ def autopilot(state, symbol_meta, valid_symbols):
             continue
         if symbol in state:
             continue
+
+        eligible_signals += 1
+        if eligible_signals > MAX_NEW_SIGNALS_PER_CYCLE:
+            break
 
         side = "BUY" if opp["trend"] == "LONG" else "SELL"
         amount = total * (ENTRY_PERCENT / 100) * LEVERAGE
@@ -982,6 +1285,18 @@ def autopilot(state, symbol_meta, valid_symbols):
 
         result = open_position(symbol, side, amount, symbol_meta)
         if result:
+            if ENABLE_PROTECTIVE_ORDERS and not DRY_RUN:
+                protection = sync_protective_orders(symbol, opp["trend"], symbol_meta, result)
+                if not protection:
+                    logger.error("Protective orders failed for %s, closing position immediately", symbol)
+                    snapshot = get_position_snapshot(symbol)
+                    if snapshot:
+                        close_position(symbol, snapshot["qty"], snapshot["direction"], symbol_meta)
+                    state[symbol] = time.time()
+                    save_recently_closed(state)
+                    continue
+                tracked_positions[symbol] = protection
+
             open_pos.append({"symbol": symbol, "dir": opp["trend"], "pct": 0.0})
             margin_percent += ENTRY_PERCENT
 
@@ -1018,11 +1333,12 @@ def main():
 
     valid_symbols = build_valid_symbols(tradable_symbols)
     state = load_recently_closed()
+    tracked_positions = {}
 
     error_streak = 0
     while True:
         try:
-            position_count = autopilot(state, symbol_meta, valid_symbols)
+            position_count = autopilot(state, tracked_positions, symbol_meta, valid_symbols)
             current_ip = get_outbound_ip(force=False)
             logger.info("Cycle done. Open positions tracked: %s | fetch_ip=%s", position_count, current_ip)
             error_streak = 0
