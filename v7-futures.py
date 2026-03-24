@@ -540,6 +540,7 @@ def generate_signal(analysis):
     direction = s["trend"]
     direction_emoji = "📈" if direction == "LONG" else "📉"
     trend_text = "BULLISH" if direction == "LONG" else "BEARISH"
+    exec_tp, exec_sl = build_protective_prices(s["price"], direction)
 
     entry_breakout = s["resistance"] * (1.01 if direction == "LONG" else 0.99)
     entry_bounce = s["support"] if direction == "LONG" else s["resistance"]
@@ -580,11 +581,14 @@ def generate_signal(analysis):
         f"1) Breakout: {entry_breakout:.6f}\n"
         f"2) Bounce/Reject: {entry_bounce:.6f}\n\n"
         f"🧠 Insight: {insight}\n\n"
-        f"🏁 Targets:\n"
+        f"🏁 Execution Targets:\n"
         f"- Entry Ref: {s['price']:.6f}\n"
-        f"- TP1: {s['tp1']:.6f} (Fib 1.272)\n"
-        f"- TP2: {s['tp2']:.6f} (Fib 1.618)\n"
-        f"- SL: {s['sl']:.6f}\n"
+        f"- TP: {exec_tp:.6f} ({TP_PERCENT:.2f}%)\n"
+        f"- SL: {exec_sl:.6f} ({SL_PERCENT:.2f}%)\n\n"
+        f"🧭 Structural Targets:\n"
+        f"- TP1: {s['tp1']:.6f} (Fib 1.272, swing target)\n"
+        f"- TP2: {s['tp2']:.6f} (Fib 1.618, swing target)\n"
+        f"- Structure SL: {s['sl']:.6f}\n"
         f"⏰ Timeframe: 1H"
     )
     return signal
@@ -815,6 +819,29 @@ def cancel_all_open_orders(symbol):
     return True
 
 
+def cancel_all_algo_orders(symbol):
+    if DRY_RUN:
+        logger.info("[DRY_RUN] Cancel all algo orders for %s", symbol)
+        return True
+
+    data = signed_request_json("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": symbol})
+    if not data:
+        logger.warning("Cancel algo orders failed %s: empty response", symbol)
+        return False
+
+    code = data.get("code") if isinstance(data, dict) else None
+    if isinstance(code, int) and code < 0:
+        logger.warning("Cancel algo orders failed %s: %s", symbol, data)
+        return False
+    return True
+
+
+def cancel_all_protective_orders(symbol):
+    normal_ok = cancel_all_open_orders(symbol)
+    algo_ok = cancel_all_algo_orders(symbol)
+    return normal_ok and algo_ok
+
+
 def build_protective_prices(entry_price, direction):
     if direction == "LONG":
         tp_price = entry_price * (1 + (TP_PERCENT / 100))
@@ -870,15 +897,16 @@ def place_protective_close_order(symbol, direction, order_type, stop_price, symb
     )
     rounded_stop = round_price(stop_price, tick_size, mode="ceil" if trigger_above else "floor")
     params = {
+        "algoType": "CONDITIONAL",
         "symbol": symbol,
         "side": side,
         "type": order_type,
-        "stopPrice": format_price(rounded_stop),
+        "triggerPrice": format_price(rounded_stop),
         "closePosition": "true",
         "workingType": PROTECTIVE_WORKING_TYPE,
         "priceProtect": "TRUE" if PROTECTIVE_PRICE_PROTECT else "FALSE",
     }
-    data = signed_request_json("POST", "/fapi/v1/order", params)
+    data = signed_request_json("POST", "/fapi/v1/algoOrder", params)
     if not data or (isinstance(data, dict) and isinstance(data.get("code"), int) and data.get("code") < 0):
         logger.warning("Protective order failed %s %s: %s", symbol, order_type, data)
         return None
@@ -889,7 +917,7 @@ def sync_protective_orders(symbol, direction, symbol_meta, order_data=None):
     if DRY_RUN or not ENABLE_PROTECTIVE_ORDERS:
         return {}
 
-    if not cancel_all_open_orders(symbol):
+    if not cancel_all_protective_orders(symbol):
         return None
 
     entry_price = 0.0
@@ -957,7 +985,7 @@ def sync_protective_orders(symbol, direction, symbol_meta, order_data=None):
     tp_result = place_protective_close_order(symbol, direction, "TAKE_PROFIT_MARKET", tp_price, symbol_meta)
     sl_result = place_protective_close_order(symbol, direction, "STOP_MARKET", sl_price, symbol_meta)
     if tp_result is None or sl_result is None:
-        cancel_all_open_orders(symbol)
+        cancel_all_protective_orders(symbol)
         return None
 
     logger.info(
@@ -1148,7 +1176,7 @@ def close_position(symbol, qty, direction, symbol_meta):
         logger.info("[DRY_RUN] Close %s %s qty=%s", side, symbol, qty_str)
         return {"dry_run": True, "symbol": symbol, "side": side, "quantity": qty_str}
 
-    cancel_all_open_orders(symbol)
+    cancel_all_protective_orders(symbol)
     data = signed_request_json(
         "POST",
         "/fapi/v1/order",
